@@ -1,0 +1,2109 @@
+---
+title: "Identifying Chinese Children with Dyslexia via Machine Learning"
+
+---
+## Setup MLP Python Environment & Error Prevention
+```{r}
+# setup-python-env
+library(reticulate)
+
+# Define the name of the virtual environment for the MLP model
+env_name <- "r-mlp"
+
+# 1) Suggest users to set their own Python path if necessary 
+# (Uncomment and modify the path below if R cannot find Python automatically)
+# use_python("C:/path/to/your/python.exe", required = TRUE)
+
+# 2) Create the virtual environment if it does not exist
+if (!virtualenv_exists(env_name)) {
+  virtualenv_create(env_name)
+}
+
+# 3) Activate the virtual environment
+use_virtualenv(env_name, required = TRUE)
+
+# 4) Install TensorFlow and Keras into the designated environment
+if (!reticulate::py_module_available("tensorflow")) {
+  cat("TensorFlow not found. Installing now...\n")
+  tensorflow::install_tensorflow(method = "virtualenv",
+                                 envname = env_name,
+                                 version = "2.15.0")
+}
+
+# 5) Verify the current Python configuration
+reticulate::py_config()
+```
+
+
+
+## Load Packages, Paths, and Seeds
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(ggplot2)
+  library(haven)
+  library(caret)
+  library(pROC)
+  library(recipes)
+  library(themis)
+  library(glmnet)
+  library(vip)
+  library(yardstick)
+  library(rsample)
+  library(xgboost)
+
+  library(fastshap)
+  library(shapviz)
+  library(keras)
+  library(iml)
+})
+
+options(dplyr.summarise.inform = FALSE)  
+
+set.seed(111) 
+
+# =====================================================================
+# Environment Setup & Working Directory
+# =====================================================================
+# Note for reproducibility: 
+# Please ensure that this .Rmd script and all associated .rds data files 
+# are stored in the same folder on your local machine. 
+# 
+# Before running the code, set your R working directory to that folder.
+# (In RStudio, you can do this via: Session -> Set Working Directory -> To Source File Location)
+
+```
+
+
+# load database
+```{r}
+RD_4ML <- readRDS("dataset_anonymized.rds")
+```
+
+
+# set model var
+```{r}
+predictor_vars_1 <- c( # Include all variables in the analysis
+  "gender", "Grade",
+  "LxclScor", "FlldScor",
+  "cnfgrtnLR", "cnfgrtnUD", 
+  "RdcNoMuti","RdcNodub", 
+  "trspT","trspV", 
+  "SRngA","SRngH", 
+  "PType_Onset","PType_Rime","PType_Tone","PType_None","PType_Mark",
+  "PType_1of3","PType_2of3","PType_3of3",
+  "LxclScor", "FlldScor",  
+  "MMCScor","MMPScor","MMFScor", 
+  "COnstScor","CRimScor","CTnScor", 
+  "POnstScor","PRimScor","PTnScor" 
+)
+
+predictor_vars_2 <- c( # Whole-character level - Phonology
+  "LxclScor",
+  "MMCScor", 
+  "COnstScor","CRimScor","CTnScor",
+  "PType_Onset","PType_Rime","PType_Tone"
+)
+
+
+predictor_vars_3 <- c( # Whole-character level - Orthography
+  "cnfgrtnLR", "cnfgrtnUD", 
+  "RdcNoMuti","RdcNodub"
+)
+
+predictor_vars_4 <- c( # Whole-character level - Semantics
+  "SRngA","SRngH"
+)
+
+predictor_vars_5 <- c( # Sub-lexical level - Phonology
+  "MMPScor","POnstScor","PRimScor","PTnScor", 
+   "PType_1of3","PType_2of3","PType_3of3","PType_None"
+)
+
+predictor_vars_6 <- c( # Sub-lexical level - Orthography
+  "PType_Mark","MMFScor"
+)
+
+predictor_vars_7 <- c( # Sub-lexical level - Semantics
+  "trspT","trspV"
+)
+
+```
+
+
+
+# t test
+```{r}
+vars_2_4T <- setdiff(predictor_vars_1, c("gender", "Grade", "DD"))
+RD_4ML_T <- RD_4ML %>%
+  dplyr::select(all_of(vars_2_4T), DD)
+
+num_vars <- names(dplyr::select(RD_4ML_T, where(is.numeric), -DD))
+
+RD_4ML_T <- RD_4ML_T %>%
+  dplyr::mutate(across(all_of(num_vars), ~ as.numeric(scale(.))))
+
+T_results <- list()
+for (var in vars_2_4T) {
+  if (!var %in% names(RD_4ML_T)) next
+  if (!is.numeric(RD_4ML_T[[var]])) next
+  formula <- as.formula(paste(var, "~ DD"))
+  t_test_raw <- RD_4ML_T %>%
+    rstatix::t_test(formula, var.equal = TRUE, detailed = TRUE)
+  
+  t_test_result <- t_test_raw %>%
+    dplyr::transmute(
+      t  = statistic,
+      df = df,
+      p_num = as.numeric(p),
+      p_sci = format(p, scientific = TRUE, digits = 3),
+      p_value = dplyr::if_else(p < 1e-4, "<0.0001", sprintf("%.4f", p))
+    )
+
+  descriptives <- RD_4ML_T %>%
+    dplyr::group_by(DD) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      mean = mean(.data[[var]], na.rm = TRUE),
+      sd = sd(.data[[var]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(
+      names_from  = DD,
+      values_from = c(n, mean, sd),
+      names_sep   = "_"
+    )
+
+  # Cohen's d
+  cohen_d_result <- RD_4ML_T %>%
+    rstatix::cohens_d(formula, ci = TRUE) %>%
+    dplyr::select(effsize, conf.low, conf.high) %>%
+    dplyr::rename(cohen_d = effsize, ci_low = conf.low, ci_high = conf.high)
+
+  combined_result <- dplyr::bind_cols(descriptives, t_test_result, cohen_d_result)
+
+  T_results[[var]] <- combined_result
+}
+
+final_results_table <- dplyr::bind_rows(T_results, .id = "Variable")
+print(final_results_table)
+
+
+final_table_formatted <- final_results_table %>%
+  dplyr::mutate(
+    `DD (n=496) M (SD)` = sprintf("%.2f (%.2f)", mean_Dyslexia, sd_Dyslexia),
+    `TD (n=6770) M (SD)` = sprintf("%.2f (%.2f)", mean_Normal, sd_Normal),
+
+    t = sprintf("%.2f", t),
+    
+    # "d [ci_low, ci_high]"
+    `Cohen's d [95% CI]` = sprintf("%.2f [%.2f, %.2f]", cohen_d, ci_low, ci_high)
+  ) %>%
+  dplyr::select(
+    Variable,
+    `DD (n=496) M (SD)`,
+    `TD (n=6770) M (SD)`,
+    t,
+    p_value,
+    `Cohen's d [95% CI]`
+  )
+final_table_formatted
+```
+
+
+# data seperating 
+```{r}
+set.seed(111)
+train_idx <- createDataPartition(RD_4ML$DD, p = 0.8, list = FALSE)
+train_full <- RD_4ML[train_idx, ]
+test_full <- RD_4ML[-train_idx, ]
+```
+
+
+
+## create sub-dataset
+```{r}
+# database for predictor_vars_1
+RD_4ML_1_train <- train_full %>%
+  select(all_of(c("DD", predictor_vars_1)))
+RD_4ML_1_test <- test_full %>%
+  select(all_of(c("DD", predictor_vars_1)))
+
+# database for predictor_vars_2
+RD_4ML_2_train <- train_full %>% 
+  select(all_of(c("DD", predictor_vars_2)))
+RD_4ML_2_test <- test_full %>% 
+  select(all_of(c("DD", predictor_vars_2)))
+
+# database for predictor_vars_3
+RD_4ML_3_train <- train_full %>% 
+  select(all_of(c("DD", predictor_vars_3)))
+RD_4ML_3_test <- test_full %>% 
+  select(all_of(c("DD", predictor_vars_3)))
+
+# database for predictor_vars_4
+RD_4ML_4_train <- train_full %>% 
+  select(all_of(c("DD", predictor_vars_4)))
+RD_4ML_4_test <- test_full %>% 
+  select(all_of(c("DD", predictor_vars_4)))
+
+# database for predictor_vars_5
+RD_4ML_5_train <- train_full %>% 
+  select(all_of(c("DD", predictor_vars_5)))
+RD_4ML_5_test <- test_full %>% 
+  select(all_of(c("DD", predictor_vars_5)))
+
+# database for predictor_vars_6
+RD_4ML_6_train <- train_full %>% 
+  select(all_of(c("DD", predictor_vars_6)))
+RD_4ML_6_test <- test_full %>% 
+  select(all_of(c("DD", predictor_vars_6)))
+
+# 数据库6：predictor_vars_7
+RD_4ML_7_train <- train_full %>% 
+  select(all_of(c("DD", predictor_vars_7)))
+RD_4ML_7_test <- test_full %>% 
+  select(all_of(c("DD", predictor_vars_7)))
+
+```
+
+# tools
+```{r}
+
+# Threshold-based binary classification counts and derived metrics (avoids yardstick zero-event warnings)
+.bin_counts <- function(truth, prob, thr){
+  pred <- factor(ifelse(prob >= thr, "Dyslexia", "Normal"),
+                 levels = c("Dyslexia","Normal"))
+  tp <- sum(truth=="Dyslexia" & pred=="Dyslexia", na.rm=TRUE)
+  fp <- sum(truth=="Normal"   & pred=="Dyslexia", na.rm=TRUE)
+  tn <- sum(truth=="Normal"   & pred=="Normal",   na.rm=TRUE)
+  fn <- sum(truth=="Dyslexia" & pred=="Normal",   na.rm=TRUE)
+  list(tp=tp, fp=fp, tn=tn, fn=fn,
+       pred=pred)
+}
+.metrics_from_counts <- function(cnt){
+  n  <- cnt$tp + cnt$fp + cnt$tn + cnt$fn
+  se <- ifelse(cnt$tp+cnt$fn>0, cnt$tp/(cnt$tp+cnt$fn), NA_real_)   # Sensitivity
+  sp <- ifelse(cnt$tn+cnt$fp>0, cnt$tn/(cnt$tn+cnt$fp), NA_real_)   # Specificity
+  pr <- ifelse(cnt$tp+cnt$fp>0, cnt$tp/(cnt$tp+cnt$fp), NA_real_)   # Precision
+  acc <- (cnt$tp + cnt$tn)/n
+  f1  <- ifelse(pr+se>0, 2*pr*se/(pr+se), NA_real_)
+  f2  <- ifelse(4*pr+se>0, 5*pr*se/(4*pr+se), NA_real_)
+  tibble::tibble(Accuracy=acc, Sensitivity=se, Specificity=sp, Precision=pr, F1=f1, F2=f2)
+}
+
+# Generate threshold table
+.pr_table <- function(truth, prob, ths = seq(0.01,0.99,by=0.01)){
+  m <- lapply(ths, function(t){
+    cnt <- .bin_counts(truth, prob, t)
+    c(threshold=t, .metrics_from_counts(cnt))
+  })
+  dplyr::bind_rows(lapply(m, as.data.frame))
+}
+
+# Priority: Maximize Sensitivity, then Specificity, then F1 score.
+pick_threshold_sen_first <- function(truth, prob, ths = seq(0.01,0.99,by=0.01)){
+  tab <- .pr_table(truth, prob, ths)
+  mx_se <- max(tab$Sensitivity, na.rm = TRUE)
+  cand  <- tab[which(tab$Sensitivity >= mx_se - 1e-12), , drop=FALSE]
+  mx_sp <- max(cand$Specificity, na.rm = TRUE)
+  cand2 <- cand[which(cand$Specificity >= mx_sp - 1e-12), , drop=FALSE]
+  idx   <- which.max(cand2$F1)
+  list(th = cand2$threshold[idx], table = tab)
+}
+
+# Calculate common metrics for a given threshold：
+.metrics_at_threshold <- function(truth, prob, th){
+  pred <- factor(ifelse(prob >= th, "Dyslexia","Normal"),
+                 levels = c("Dyslexia","Normal"))
+  tp <- sum(truth=="Dyslexia" & pred=="Dyslexia")
+  fp <- sum(truth=="Normal"   & pred=="Dyslexia")
+  tn <- sum(truth=="Normal"   & pred=="Normal")
+  fn <- sum(truth=="Dyslexia" & pred=="Normal")
+  prec <- ifelse(tp+fp>0, tp/(tp+fp), NA_real_)
+  rec  <- ifelse(tp+fn>0, tp/(tp+fn), NA_real_)            #  Sensitivity
+  spec <- ifelse(tn+fp>0, tn/(tn+fp), NA_real_)
+  acc  <- (tp+tn)/(tp+fp+tn+fn)
+  f1   <- ifelse(prec+rec>0, 2*prec*rec/(prec+rec), NA_real_)
+  f2   <- ifelse(4*prec+rec>0, 5*prec*rec/(4*prec+rec), NA_real_)
+  list(Accuracy=acc, Sensitivity=rec, Specificity=spec,
+       Precision=prec, F1=f1, F2=f2)
+}
+
+threshold_select_composite <- function(truth, prob,
+                                       method = c("youden","closest_topleft"),
+                                       tie_breaker = c("F1","Precision")){
+  method      <- match.arg(method)
+  tie_breaker <- match.arg(tie_breaker)
+
+  roc_obj <- pROC::roc(truth, prob, levels = c("Dyslexia","Normal"), direction = ">")
+  tab <- as.data.frame(pROC::coords(
+    roc_obj, x = "all",
+    ret = c("threshold","sensitivity","specificity","accuracy","ppv"), 
+    transpose = TRUE
+  ))
+  names(tab) <- c("thr","se","sp","acc","ppv")
+
+  tab$se  <- as.numeric(tab$se)
+  tab$sp  <- as.numeric(tab$sp)
+  tab$acc <- as.numeric(tab$acc)
+  tab$ppv <- as.numeric(tab$ppv)
+  tab$J   <- tab$se + tab$sp - 1
+  tab$dist <- sqrt((1 - tab$se)^2 + (1 - tab$sp)^2)
+  tab$F1  <- ifelse(tab$ppv + tab$se > 0, 2*tab$ppv*tab$se/(tab$ppv + tab$se), NA_real_)
+
+  if (method == "youden"){
+    idx <- which(tab$J == max(tab$J, na.rm = TRUE))
+    # # Break ties using F1 or Precision
+    if (length(idx) > 1){
+      pick <- tab[idx, ]
+      ord  <- order(pick$F1, pick$ppv, decreasing = TRUE)
+      idx  <- idx[ord][1]
+    } else idx <- idx[1]
+  } else { # closest_topleft
+    idx <- which(tab$dist == min(tab$dist, na.rm = TRUE))
+    if (length(idx) > 1){
+      pick <- tab[idx, ]
+      ord  <- if (tie_breaker == "F1") order(pick$F1, pick$ppv, decreasing = TRUE)
+              else                     order(pick$ppv, pick$F1, decreasing = TRUE)
+      idx  <- idx[ord][1]
+    } else idx <- idx[1]
+  }
+  th <- tab$thr[idx]
+  list(th = th, table = tab, pick = idx)
+}
+
+make_recipe <- function(df,
+                        smote_ratio = 0.6,
+                        id_cols     = c(".row_id")) {
+  if (!is.factor(df$DD)) {
+    df$DD <- factor(df$DD,
+                    levels = c("Dyslexia", "Normal")) 
+  } else {
+    df$DD <- factor(df$DD, levels = c("Dyslexia", "Normal"))
+  }
+
+  rec <- recipes::recipe(DD ~ ., data = df)
+  keep_ids <- intersect(id_cols, names(df))
+  if (length(keep_ids) > 0) {
+    rec <- recipes::update_role(rec, tidyselect::all_of(keep_ids), new_role = "id")
+  }
+
+  rec <- rec %>%
+    recipes::step_string2factor(recipes::all_nominal_predictors()) %>%  # Convert strings to factors
+    recipes::step_novel(recipes::all_nominal_predictors()) %>%          # Mark novel levels in test set as "new"
+    recipes::step_dummy(recipes::all_nominal_predictors(), one_hot = TRUE) %>%  # One-hot encodin
+    recipes::step_zv(recipes::all_predictors()) %>%                    # Remove zero-variance predictors
+    recipes::step_normalize(recipes::all_numeric_predictors()) %>%     # Standardize (mean = 0, SD = 1)
+    themis::step_smote(DD, over_ratio = smote_ratio, seed = 111, skip = TRUE)  # SMOTE
+  rec
+}
+
+ # 
+make_ConSens_summary <- function(spec_floor = 0.80,
+                                 acc_floor  = 0.80,
+                                 ths = seq(0.01, 0.99, by = 0.01)) {
+  pr_table_local <- function(truth, prob, ths) {
+    lev1 <- levels(truth)[1]; lev2 <- levels(truth)[2]
+    out <- lapply(ths, function(t){
+      pred <- factor(ifelse(prob >= t, lev1, lev2), levels = c(lev1, lev2))
+      tp <- sum(truth==lev1 & pred==lev1); fp <- sum(truth==lev2 & pred==lev1)
+      tn <- sum(truth==lev2 & pred==lev2); fn <- sum(truth==lev1 & pred==lev2)
+      se  <- ifelse(tp+fn>0, tp/(tp+fn), 0)
+      sp  <- ifelse(tn+fp>0, tn/(tn+fp), 0)
+      acc <- ifelse(tp+fp+tn+fn>0, (tp+tn)/(tp+fp+tn+fn), 0)
+      data.frame(threshold=t, Sensitivity=se, Specificity=sp, Accuracy=acc)
+    })
+    do.call(rbind, out)
+  }
+  function(data, lev = NULL, model = NULL){
+    if (is.null(lev) || length(lev)!=2) return(c(ConSens=0))
+    if (!lev[1] %in% names(data) || !"obs" %in% names(data)) return(c(ConSens=0))
+    truth <- factor(data$obs, levels = lev)
+    prob  <- suppressWarnings(as.numeric(data[[lev[1]]]))
+    if (!any(is.finite(prob))) return(c(ConSens=0))
+    tab <- pr_table_local(truth, prob, ths)
+    ok  <- with(tab, Specificity>=spec_floor & Accuracy>=acc_floor &
+                      is.finite(Sensitivity) & is.finite(Specificity) & is.finite(Accuracy))
+    if (!any(ok)) return(c(ConSens=0))
+    c(ConSens = max(tab$Sensitivity[ok], na.rm = TRUE))
+  }
+}
+
+pick_threshold_constrained <- function(truth, prob,
+                                       ths, target_sens_val, min_spec_val, min_acc_val){
+  tab  <- .pr_table(truth, prob, ths)
+  feas <- subset(tab, Specificity >= min_spec_val & Accuracy >= min_acc_val)
+  feas90 <- subset(feas, Sensitivity >= target_sens_val)
+  if (nrow(feas90)){
+    J <- with(feas90, Sensitivity + Specificity - 1)
+    best <- feas90[order(-J, -feas90$F1), ][1,,drop=FALSE]
+    return(list(th=best$threshold, table=tab, best_row=best, met_all=TRUE))
+  }
+  if (nrow(feas)){
+    J <- with(feas, Sensitivity + Specificity - 1)
+    best <- feas[order(-feas$Sensitivity, -J, -feas$F1), ][1,,drop=FALSE]
+    return(list(th=best$threshold, table=tab, best_row=best, met_all=FALSE))
+  }
+  J <- with(tab, Sensitivity + Specificity - 1)
+  best <- tab[order(-J, -tab$F1), ][1,,drop=FALSE]
+  list(th=best$threshold, table=tab, best_row=best, met_all=FALSE)
+}
+
+get_result_obj <- function(prefix, i, env = parent.frame()){
+  get0(sprintf("%s_15sd_results_%d", prefix, i), envir = env, ifnotfound = NULL)
+}
+
+fetch_probs_safe <- function(obj){
+  if (is.null(obj)) return(NULL)
+  if (!is.null(obj$probs_test)) return(as.numeric(obj$probs_test))
+  NULL
+}
+
+.gen_weight_grid <- function(M, step = 0.10, tol = 1e-9){
+  vals <- seq(0, 1, by = step)
+  rec <- function(k, rest){
+    if (k == M) return(matrix(rest, nrow = 1))
+    out <- list()
+    for (v in vals) {
+      if (v > rest + tol) next
+      sub <- rec(k + 1, rest - v)
+      if (is.matrix(sub)) out[[length(out)+1]] <- cbind(v, sub)
+    }
+    if (!length(out)) return(NULL)
+    do.call(rbind, out)
+  }
+  ans <- rec(1, 1)
+  ans[rowSums(ans) >= 1 - 1e-8 & rowSums(ans) <= 1 + 1e-8, , drop = FALSE]
+}
+
+.pick_threshold_constrained_local <- function(truth, prob, ths,
+                                              min_spec, min_acc, target_sens){
+  tab  <- .pr_table(truth, prob, ths)
+  feas <- subset(tab, Specificity >= min_spec & Accuracy >= min_acc)
+
+  if (nrow(feas) > 0) {
+    feas90 <- subset(feas, Sensitivity >= target_sens)
+    if (nrow(feas90) > 0) {
+      J <- with(feas90, Sensitivity + Specificity - 1)
+      best <- feas90[order(-J, -feas90$F1), ][1, , drop = FALSE]
+      return(list(th = as.numeric(best$threshold), best_row = best, status = "HIT"))
+    } else {
+      J <- with(feas, Sensitivity + Specificity - 1)
+      best <- feas[order(-feas$Sensitivity, -J, -feas$F1), ][1, , drop = FALSE]
+      return(list(th = as.numeric(best$threshold), best_row = best, status = "LIMIT"))
+    }
+  }
+  J <- with(tab, Sensitivity + Specificity - 1)
+  best <- tab[order(-J, -tab$F1), ][1, , drop = FALSE]
+  list(th = as.numeric(best$threshold), best_row = best, status = "NO_FEASIBLE")
+}
+
+build_prob_surrogate <- function(X_ref, p_ref) {
+  if (!requireNamespace("glmnet", quietly = TRUE)) {
+    stop("需要 glmnet 包：install.packages('glmnet')")
+  }
+  Xm  <- as.matrix(X_ref)
+  fit <- glmnet::cv.glmnet(x = Xm, y = as.numeric(p_ref), family = "gaussian",
+                           alpha = 0, nfolds = 5)
+  function(newdata) {
+    pr <- as.numeric(predict(fit, newx = as.matrix(newdata), s = "lambda.min"))
+    pmin(pmax(pr, 1e-6), 1 - 1e-6)
+  }
+}
+
+
+.cm_counts <- function(truth, pred){
+  tp <- sum(truth=="Dyslexia" & pred=="Dyslexia", na.rm=TRUE)
+  fp <- sum(truth=="Normal"   & pred=="Dyslexia", na.rm=TRUE)
+  tn <- sum(truth=="Normal"   & pred=="Normal",   na.rm=TRUE)
+  fn <- sum(truth=="Dyslexia" & pred=="Normal",   na.rm=TRUE)
+  list(tp=tp, fp=fp, tn=tn, fn=fn)
+}
+
+.cm2matrix <- function(cnt){
+  m <- matrix(c(cnt$tp, cnt$fp, cnt$fn, cnt$tn), nrow=2, byrow=TRUE)
+  rownames(m) <- c("Pred=Dyslexia","Pred=Normal")
+  colnames(m) <- c("Truth=Dyslexia","Truth=Normal")
+  m
+}
+
+.metrics_from_counts <- function(cnt){
+  n  <- cnt$tp + cnt$fp + cnt$tn + cnt$fn
+  prec <- ifelse(cnt$tp+cnt$fp>0, cnt$tp/(cnt$tp+cnt$fp), NA_real_)
+  rec  <- ifelse(cnt$tp+cnt$fn>0, cnt$tp/(cnt$tp+cnt$fn), NA_real_)
+  spec <- ifelse(cnt$tn+cnt$fp>0, cnt$tn/(cnt$tn+cnt$fp), NA_real_)
+  acc  <- (cnt$tp + cnt$tn) / n
+  f1   <- ifelse(prec+rec>0, 2*prec*rec/(prec+rec), NA_real_)
+  f2   <- ifelse(4*prec+rec>0, 5*prec*rec/(4*prec+rec), NA_real_)
+  tibble::tibble(Accuracy=acc, Sensitivity=rec, Specificity=spec,
+                 Precision=prec, F1=f1, F2=f2)
+}
+```
+
+
+
+# define shap
+```{r}
+
+ensure_cols <- function(X_df, vec_needed){
+  missing <- setdiff(vec_needed, colnames(X_df))
+  if(length(missing)){
+    for (v in missing) X_df[[v]] <- 0
+  }
+  X_df <- X_df[, vec_needed, drop = FALSE]
+  return(as.matrix(X_df))
+}
+
+.prob_clip <- function(p, eps = 1e-6) pmax(pmin(p, 1 - eps), eps)
+.logit <- function(p) qlogis(.prob_clip(p))
+.sigmoid <- function(z) plogis(z)
+
+compute_shap <- function(model, X_mat, y_factor,
+                         pred_fun = NULL, pred_fun_prob = NULL,
+                         top_features = NULL, top_n = 10,
+                         nsim = 100, base_use = c("mean_logit","median_logit")) {
+  base_use <- match.arg(base_use)
+  f_prob <- if (!is.null(pred_fun_prob)) pred_fun_prob else
+            if (!is.null(pred_fun))      pred_fun else
+            stop("compute_shap() requires pred_fun_prob (or pred_fun) - a function returning the probability of 'Dyslexia'.")
+
+  .prob_clip <- function(p, eps=1e-6) pmax(pmin(p, 1-eps), eps)
+  .logit <- function(p) qlogis(.prob_clip(p))
+  .sigmoid <- function(z) plogis(z)
+
+  if (!is.null(top_features)) {
+    X_mat <- X_mat[, intersect(top_features, colnames(X_mat)), drop=FALSE]
+  }
+  X_df <- as.data.frame(X_mat)
+
+  pred_fun_logit <- function(m, newdata) .logit(f_prob(m, as.data.frame(newdata)))
+
+  shap_logit <- fastshap::explain(
+    object       = model,
+    X            = X_df,
+    pred_wrapper = pred_fun_logit,
+    nsim         = nsim,
+    adjust       = TRUE
+  )
+  if (is.null(shap_logit) || nrow(shap_logit) == 0) stop("SHAP matrix is empty.")
+
+  base_logit_vec <- pred_fun_logit(model, X_df)
+  base_logit <- if (base_use=="mean_logit") mean(base_logit_vec) else median(base_logit_vec)
+
+  # logit-SHAP →  Δp
+  delta_p <- apply(shap_logit, 2, function(sj) .sigmoid(base_logit + sj) - .sigmoid(base_logit))
+  imp_df <- tibble::tibble(
+    Feature       = colnames(delta_p),
+    MeanAbsDeltaP = colMeans(abs(delta_p), na.rm = TRUE)
+  ) |>
+    dplyr::arrange(dplyr::desc(MeanAbsDeltaP)) |>
+    dplyr::slice_head(n = top_n)
+
+  shap_imp_plot <- ggplot2::ggplot(
+      imp_df, ggplot2::aes(x = reorder(Feature, MeanAbsDeltaP), y = MeanAbsDeltaP * 100)
+    ) +
+    ggplot2::geom_col(width = 0.7, fill = "gray") +
+    ggplot2::coord_flip() +
+    ggplot2::labs(title = paste0("Top ", top_n, " SHAP (mean |Δp|)"),
+                  x = "Feature", y = "Mean |Δp| (%)") +
+    ggplot2::theme_minimal() +
+    ggplot2::scale_y_continuous(limits = c(0, 50), breaks = seq(0, 50, by = 10),
+                                expand = ggplot2::expansion(mult = c(0, 0.02)))
+
+  sv_obj <- tryCatch(
+  shapviz::shapviz(shap_logit, X = X_df, y = y_factor),
+  error = function(e){
+    message("[shapviz] Ignoring y:", e$message)
+    shapviz::shapviz(shap_logit, X = X_df)  
+    }
+  )
+
+  list(
+    matrix   = delta_p, 
+    sv       = sv_obj,
+    plot     = shap_imp_plot,
+    imp_df   = imp_df,
+    base_logit = base_logit
+  )
+}
+```
+
+
+
+##  define LR
+```{r}
+run_lr_analysis <- function(train_data, test_data, dataset_name,
+                            nfold = 10, smote_ratio = 0.6,
+                            min_spec = 0.80,   
+                            min_acc  = 0.80,    
+                            target_sens = 0.90, 
+                            th_grid = seq(0.01, 0.99, by = 0.01),
+                            top_n_shap  = 10) {
+
+  set.seed(111)
+
+  if (is.factor(train_data$DD) && levels(train_data$DD)[1] != "Dyslexia")
+    train_data$DD <- factor(train_data$DD, levels = c("Dyslexia","Normal"))
+  if (is.factor(test_data$DD) && levels(test_data$DD)[1] != "Dyslexia")
+    test_data$DD  <- factor(test_data$DD,  levels = c("Dyslexia","Normal"))
+
+  for (nom in c("gender","Grade")) if (nom %in% names(train_data)) {
+    train_data[[nom]] <- factor(as.character(train_data[[nom]]))
+    test_data[[nom]]  <- factor(as.character(test_data[[nom]]), levels = levels(train_data[[nom]]))
+  }
+
+  # SMOTE
+  rec_full  <- make_recipe(train_data, smote_ratio = smote_ratio)
+  prep_full <- recipes::prep(rec_full, training = train_data)
+  tr_full   <- recipes::juice(prep_full)                      # Training set (with SMOTE)
+  te_full   <- recipes::bake(prep_full, new_data = test_data) # Test set (without SMOTE)
+  y_tr      <- train_data$DD
+  y_te      <- test_data$DD
+
+  make_ConSens_summary <- function(spec_floor = 0.80,
+                                   acc_floor  = 0.80,
+                                   ths = seq(0.01, 0.99, by = 0.01)) {
+  
+   
+    pr_table_local <- function(truth, prob, ths) {
+      lev1 <- levels(truth)[1]  
+      lev2 <- levels(truth)[2]
+      out <- lapply(ths, function(t) {
+        pred <- ifelse(prob >= t, lev1, lev2)
+        pred <- factor(pred, levels = c(lev1, lev2))
+  
+        tp <- sum(truth==lev1 & pred==lev1)
+        fp <- sum(truth==lev2 & pred==lev1)
+        tn <- sum(truth==lev2 & pred==lev2)
+        fn <- sum(truth==lev1 & pred==lev2)
+  
+        se  <- ifelse(tp+fn>0, tp/(tp+fn), 0)             
+        sp  <- ifelse(tn+fp>0, tn/(tn+fp), 0)
+        acc <- ifelse(tp+fp+tn+fn>0, (tp+tn)/(tp+fp+tn+fn), 0)
+        data.frame(threshold = t, Sensitivity = se, Specificity = sp, Accuracy = acc)
+      })
+      do.call(rbind, out)
+    }
+    function(data, lev = NULL, model = NULL) {
+      if (is.null(lev) || length(lev) != 2)    return(c(ConSens = 0))
+      if (!lev[1] %in% names(data))            return(c(ConSens = 0))
+      if (!("obs" %in% names(data)))           return(c(ConSens = 0))
+  
+      truth <- factor(data$obs, levels = lev)
+      prob  <- suppressWarnings(as.numeric(data[[lev[1]]]))
+      if (!any(is.finite(prob)))               return(c(ConSens = 0))
+  
+      tab <- pr_table_local(truth, prob, ths)
+  
+      ok <- with(tab, (Specificity >= spec_floor) & (Accuracy >= acc_floor) &
+                      is.finite(Sensitivity) & is.finite(Specificity) & is.finite(Accuracy))
+      if (!any(ok)) return(c(ConSens = 0))
+  
+      cons <- max(tab$Sensitivity[ok], na.rm = TRUE)
+      if (!is.finite(cons)) cons <- 0
+  
+      c(ConSens = as.numeric(cons))
+    }
+  }
+
+  customSummary <- make_ConSens_summary(spec_floor = min_spec,
+                                      acc_floor  = min_acc,
+                                      ths        = th_grid)
+
+  train_with_id <- dplyr::mutate(train_data, .row_id = dplyr::row_number())
+  folds <- rsample::vfold_cv(train_with_id, v = nfold, strata = "DD")
+  oof_lr <- numeric(nrow(train_with_id))
+
+  for (k in seq_along(folds$splits)) {
+    dat_tr <- rsample::analysis(folds$splits[[k]])
+    dat_va <- rsample::assessment(folds$splits[[k]])
+    idx_va <- dat_va$.row_id
+
+    for (nom in c("gender","Grade")) if (nom %in% names(dat_tr)) {
+      dat_tr[[nom]] <- factor(as.character(dat_tr[[nom]]))
+      dat_va[[nom]] <- factor(as.character(dat_va[[nom]]), levels = levels(dat_tr[[nom]]))
+    }
+
+    rec_k  <- make_recipe(dplyr::select(dat_tr, - .row_id), smote_ratio = smote_ratio)
+    prep_k <- recipes::prep(rec_k, training = dat_tr)
+    tr_k   <- recipes::juice(prep_k)                               
+    va_k   <- recipes::bake(prep_k, new_data = dplyr::select(dat_va, - .row_id)) 
+
+    ctrl <- caret::trainControl(method = "cv", number = 5,
+                                classProbs = TRUE,
+                                summaryFunction = customSummary,
+                                verboseIter = FALSE)
+    grid <- expand.grid(alpha = c(0, 0.5, 1),
+                        lambda = 10^seq(-4, 0, length.out = 40))
+    
+    fit_lr <- caret::train(DD ~ ., data = tr_k,
+                           method = "glmnet",
+                           trControl = ctrl,
+                           tuneGrid = grid,
+                           metric = "ConSens")  
+
+    oof_pred <- as.numeric(predict(fit_lr, va_k, type = "prob")[, "Dyslexia"])
+    oof_lr[idx_va] <- oof_pred
+  }
+  
+  
+  pick_threshold_constrained <- function(truth, prob,
+                                       ths = th_grid,
+                                       target_sens_val = target_sens,
+                                       min_spec_val    = min_spec,
+                                       min_acc_val     = min_acc) {
+  tab  <- .pr_table(truth, prob, ths)
+  feas <- subset(tab, Specificity >= min_spec_val & Accuracy >= min_acc_val)
+
+  feas_target <- subset(feas, Sensitivity >= target_sens_val)
+  if (nrow(feas_target)) {
+    J <- with(feas_target, Sensitivity + Specificity - 1)
+    best <- feas_target[order(-J, -feas_target$F1), ][1, , drop = FALSE]
+    return(list(th = best$threshold, table = tab, best_row = best, met_all = TRUE))
+  }
+
+  if (nrow(feas)) {
+    J <- with(feas, Sensitivity + Specificity - 1)
+    best <- feas[order(-feas$Sensitivity, -J, -feas$F1), ][1, , drop = FALSE]
+    return(list(th = best$threshold, table = tab, best_row = best, met_all = FALSE))
+  }
+
+  J <- with(tab, Sensitivity + Specificity - 1)
+  best <- tab[order(-J, -tab$F1), ][1, , drop = FALSE]
+  warning(sprintf("Threshold satisfying Sp>=%.2f & Acc>=%.2f not found; returning max J point (Se=%.3f, Sp=%.3f, Acc=%.3f, thr=%.2f).",
+                  min_spec_val, min_acc_val, best$Sensitivity, best$Specificity, best$Accuracy, best$threshold))
+  list(th = best$threshold, table = tab, best_row = best, met_all = FALSE)
+}
+
+  thr_pick <- pick_threshold_constrained(
+    train_data$DD, oof_lr,
+    ths = th_grid,
+    target_sens_val = target_sens,
+    min_spec_val    = min_spec,
+    min_acc_val     = min_acc
+  )
+  th_star <- as.numeric(thr_pick$th) 
+  
+  sel_idx <- which.min(abs(thr_pick$table$threshold - th_star))
+  thresh_selected_row <- thr_pick$table[sel_idx, , drop = FALSE]
+  
+
+  ctrl_all <- caret::trainControl(method = "cv", number = 10,
+                                  classProbs = TRUE,
+                                  summaryFunction = customSummary)
+  grid_all <- expand.grid(alpha = c(0, 0.5, 1),
+                          lambda = 10^seq(-4, 0, length.out = 60))
+  
+  fit_lr_full <- caret::train(DD ~ ., data = tr_full,
+                              method = "glmnet",
+                              trControl = ctrl_all,
+                              tuneGrid = grid_all,
+                              metric = "ConSens")
+
+  p_lr_test <- as.numeric(predict(fit_lr_full, te_full, type = "prob")[, "Dyslexia"])
+  truth_te  <- factor(y_te, levels = c("Dyslexia","Normal"))
+  pred_te   <- factor(ifelse(p_lr_test >= th_star, "Dyslexia","Normal"),
+                      levels = c("Dyslexia","Normal"))
+
+
+  tp <- sum(truth_te=="Dyslexia" & pred_te=="Dyslexia")
+  fp <- sum(truth_te=="Normal"   & pred_te=="Dyslexia")
+  tn <- sum(truth_te=="Normal"   & pred_te=="Normal")
+  fn <- sum(truth_te=="Dyslexia" & pred_te=="Normal")
+  Acc <- tibble::tibble(
+    Accuracy    = (tp+tn)/max(1,tp+fp+tn+fn),
+    Sensitivity = ifelse(tp+fn>0, tp/(tp+fn), NA_real_),
+    Specificity = ifelse(tn+fp>0, tn/(tn+fp), NA_real_),
+    Precision   = ifelse(tp+fp>0, tp/(tp+fp), NA_real_),
+    F1          = ifelse((2*tp+fp+fn)>0, 2*tp/(2*tp+fp+fn), NA_real_),
+    F2          = ifelse((5*tp+4*fn+fp)>0, 5*tp/(5*tp+4*fn+fp), NA_real_)
+  )
+
+  conf_df <- tibble::tibble(truth = truth_te, pred = pred_te)
+  conf_mx <- yardstick::conf_mat(conf_df, truth = truth, estimate = pred)
+
+  metrics <- tibble::tibble(
+    Dataset         = dataset_name,
+    Threshold       = round(th_star, 2),       
+    Threshold_exact = signif(th_star, 12),    
+    AUC         = as.numeric(yardstick::roc_auc_vec(truth_te, p_lr_test, event_level = "first")),
+    Accuracy    = Acc$Accuracy,
+    Sensitivity = Acc$Sensitivity,
+    Specificity = Acc$Specificity,
+    Precision   = Acc$Precision,
+    F1          = Acc$F1,
+    F2          = Acc$F2
+  )
+
+  # SHAP
+  X_for_shap <- tr_full %>% dplyr::select(-DD) %>% as.data.frame()
+  pred_fun_lr_prob <- function(model, newdata){
+    newdata <- as.data.frame(newdata)
+    as.numeric(predict(model, newdata = newdata, type = "prob")[, "Dyslexia"])
+  }
+  lr_shap <- compute_shap(
+    model        = fit_lr_full,
+    X_mat        = X_for_shap,
+    y_factor     = y_tr,
+    pred_fun_prob= pred_fun_lr_prob,
+    nsim         = 100,
+    top_n        = top_n_shap
+  )
+
+  
+  best_oof_row <- as.data.frame(thr_pick$best_row)
+  thr_rep      <- as.numeric(best_oof_row$threshold)
+
+  truth <- factor(truth_te, levels = c("Dyslexia","Normal"))
+  pred  <- factor(ifelse(p_lr_test >= thr_rep, "Dyslexia","Normal"),
+                  levels = c("Dyslexia","Normal"))
+
+  tp <- sum(truth=="Dyslexia" & pred=="Dyslexia")
+  fp <- sum(truth=="Normal"   & pred=="Dyslexia")
+  tn <- sum(truth=="Normal"   & pred=="Normal")
+  fn <- sum(truth=="Dyslexia" & pred=="Normal")
+
+  rep_metrics_test <- data.frame(
+    Thr_from_OOF = thr_rep,
+    OOF_Sens = best_oof_row$Sensitivity,
+    OOF_Spec = best_oof_row$Specificity,
+    OOF_Acc  = best_oof_row$Accuracy,
+    OOF_F1   = best_oof_row$F1,
+    Test_Sens = ifelse(tp+fn>0, tp/(tp+fn), NA_real_),
+    Test_Spec = ifelse(tn+fp>0, tn/(tn+fp), NA_real_),
+    Test_Acc  = (tp+tn)/max(1, tp+fp+tn+fn),
+    Test_Prec = ifelse(tp+fp>0, tp/(tp+fp), NA_real_),
+    Test_F1   = ifelse((2*tp+fp+fn)>0, 2*tp/(2*tp+fp+fn), NA_real_)
+  )
+
+  pick_rep <- list(row = best_oof_row)
+
+  list(
+    metrics      = metrics,
+    conf_mat     = conf_mx,
+    probs_test   = p_lr_test,
+    truth_test   = truth_te,
+    threshold    = th_star,
+    thresh_table = thr_pick$table,     
+    thresh_best  = thr_pick$best_row,    
+    report_best_row     = pick_rep$row,  
+    report_test_at_best = rep_metrics_test,
+    threshold_exact = th_star,
+    thresh_selected_row = thresh_selected_row,
+    params = list(min_spec = min_spec, min_acc = min_acc,
+                target_sens = target_sens, th_grid = th_grid),
+    roc_plot     = {
+      roc_obj <- pROC::roc(response = truth_te, predictor = p_lr_test,
+                           levels = c("Dyslexia","Normal"), direction = ">")
+      pROC::ggroc(roc_obj) +
+        ggplot2::geom_abline(linetype = "dashed", colour = "grey") +
+        ggplot2::annotate("text", x = 0.7, y = 0.3,
+                          label = paste("AUC =", round(pROC::auc(roc_obj), 3))) +
+        ggplot2::labs(title = paste("ROC Curve - LR -", dataset_name),
+                      x = "False Positive Rate", y = "True Positive Rate") +
+        ggplot2::theme_bw()
+    },
+    shap_plot    = lr_shap$plot,
+    shap_values  = lr_shap$matrix,
+    shap_imp_df  = lr_shap$imp_df,
+    model        = fit_lr_full,
+    x_test       = te_full %>% dplyr::select(-DD)
+  )
+
+}
+
+```
+
+
+##  define RF
+```{r}
+run_rf_analysis <- function(train_data, test_data, dataset_name,
+                            nfold = 10, smote_ratio = 0.6,
+                            min_spec = 0.80, min_acc = 0.80, target_sens = 0.90,
+                            th_grid = seq(0.01,0.99,0.01),
+                            num.trees = 500,
+                            top_n_shap = 10){
+  set.seed(111)
+  for (nm in c("DD","gender","Grade")) if (nm %in% names(train_data)){
+    if (nm=="DD"){
+      train_data$DD <- factor(train_data$DD, levels=c("Dyslexia","Normal"))
+      test_data$DD  <- factor(test_data$DD,  levels=c("Dyslexia","Normal"))
+    } else {
+      train_data[[nm]] <- factor(as.character(train_data[[nm]]))
+      test_data[[nm]]  <- factor(as.character(test_data[[nm]]), levels=levels(train_data[[nm]]))
+    }
+  }
+
+  rec_full  <- make_recipe(train_data, smote_ratio = smote_ratio)
+  prep_full <- recipes::prep(rec_full, training=train_data)
+  tr_full   <- recipes::juice(prep_full)
+  te_full   <- recipes::bake(prep_full, new_data=test_data)
+  y_tr <- train_data$DD; y_te <- test_data$DD
+
+
+  customSummary <- make_ConSens_summary(min_spec, min_acc, th_grid)
+
+  train_with_id <- dplyr::mutate(train_data, .row_id = dplyr::row_number())
+  folds <- rsample::vfold_cv(train_with_id, v = nfold, strata = "DD")
+  oof <- numeric(nrow(train_with_id))
+
+  for (k in seq_along(folds$splits)){
+    dat_tr <- rsample::analysis(folds$splits[[k]])
+    dat_va <- rsample::assessment(folds$splits[[k]])
+    idx_va <- dat_va$.row_id
+
+    for (nm in c("gender","Grade")) if (nm %in% names(dat_tr)){
+      dat_tr[[nm]] <- factor(as.character(dat_tr[[nm]]))
+      dat_va[[nm]] <- factor(as.character(dat_va[[nm]]), levels=levels(dat_tr[[nm]]))
+    }
+
+    rec_k  <- make_recipe(dplyr::select(dat_tr, - .row_id), smote_ratio=smote_ratio)
+    prep_k <- recipes::prep(rec_k, training=dat_tr)
+    tr_k   <- recipes::juice(prep_k)
+    va_k   <- recipes::bake(prep_k, new_data=dplyr::select(dat_va, - .row_id))
+
+    ctrl <- caret::trainControl(method="cv", number=5, classProbs=TRUE, summaryFunction=customSummary)
+    grid <- expand.grid(
+      mtry          = pmax(1, round(c(0.1, 0.3, 0.5) * (ncol(tr_k)-1))), 
+      splitrule     = c("gini","extratrees"),
+      min.node.size = c(1, 5, 10)
+    )
+
+    fit <- caret::train(DD ~ ., data=tr_k,
+                        method="ranger", trControl=ctrl, tuneGrid=grid,
+                        metric="ConSens",
+                        num.trees=num.trees,  importance="impurity")
+    oof[idx_va] <- as.numeric(predict(fit, va_k, type="prob")[,"Dyslexia"])
+  }
+
+  thr_pick <- pick_threshold_constrained(train_data$DD, oof, th_grid, target_sens, min_spec, min_acc)
+  th_star  <- as.numeric(thr_pick$th)
+  sel_idx  <- which.min(abs(thr_pick$table$threshold - th_star))
+  thresh_selected_row <- thr_pick$table[sel_idx, , drop = FALSE]
+
+  ctrl_all <- caret::trainControl(method="cv", number=10, classProbs=TRUE, summaryFunction=customSummary)
+  grid_all <- expand.grid(
+    mtry          = pmax(1, round(c(0.1, 0.3, 0.5) * (ncol(tr_full)-1))),
+    splitrule     = c("gini","extratrees"),
+    min.node.size = c(1, 5, 10)
+  )
+  fit_full <- caret::train(DD ~ ., data=tr_full, method="ranger",
+                           trControl=ctrl_all, tuneGrid=grid_all, metric="ConSens",
+                           num.trees=num.trees, importance="impurity")
+
+  p_test <- as.numeric(predict(fit_full, te_full, type="prob")[,"Dyslexia"])
+  truth  <- factor(y_te, levels=c("Dyslexia","Normal"))
+  pred   <- factor(ifelse(p_test>=th_star, "Dyslexia","Normal"), levels=c("Dyslexia","Normal"))
+
+  tp <- sum(truth=="Dyslexia" & pred=="Dyslexia"); fp <- sum(truth=="Normal" & pred=="Dyslexia")
+  tn <- sum(truth=="Normal" & pred=="Normal");     fn <- sum(truth=="Dyslexia" & pred=="Normal")
+
+  metrics <- tibble::tibble(
+    Dataset         = dataset_name,
+    Threshold       = round(th_star,2),
+    Threshold_exact = signif(th_star,12),
+    AUC         = as.numeric(yardstick::roc_auc_vec(truth, p_test, event_level="first")),
+    Accuracy    = (tp+tn)/(tp+fp+tn+fn),
+    Sensitivity = ifelse(tp+fn>0, tp/(tp+fn), NA_real_),
+    Specificity = ifelse(tn+fp>0, tn/(tn+fp), NA_real_),
+    Precision   = ifelse(tp+fp>0, tp/(tp+fp), NA_real_),
+    F1          = ifelse((2*tp+fp+fn)>0, 2*tp/(2*tp+fp+fn), NA_real_),
+    F2          = ifelse((5*tp+4*fn+fp)>0, 5*tp/(5*tp+4*fn+fp), NA_real_)
+  )
+
+  conf_mx <- yardstick::conf_mat(tibble::tibble(truth=truth, pred=pred),
+                                 truth=truth, estimate=pred)
+
+  X_for_shap <- tr_full %>% dplyr::select(-DD) %>% as.data.frame()
+  pred_fun_prob <- function(model, newdata){
+    as.numeric(predict(model, newdata=as.data.frame(newdata), type="prob")[,"Dyslexia"])
+  }
+  rf_shap <- compute_shap(fit_full, X_for_shap, y_tr, pred_fun_prob, nsim=100, top_n=top_n_shap)
+
+  list(
+    metrics = metrics,
+    conf_mat = conf_mx,
+    probs_test = p_test,
+    truth_test = truth,
+    threshold = th_star,
+    thresh_table = thr_pick$table,
+    thresh_best = thr_pick$best_row,
+    thresh_selected_row = thresh_selected_row,
+    threshold_exact = th_star,
+    params = list(min_spec=min_spec, min_acc=min_acc, target_sens=target_sens, th_grid=th_grid),
+    shap_plot = rf_shap$plot,
+    shap_values_logit = rf_shap$shap_logit,
+    shap_values_deltap = rf_shap$shap_deltap,
+    shap_imp_deltap = rf_shap$imp_deltap,
+    model = fit_full,
+    x_test = te_full %>% dplyr::select(-DD)
+  )
+}
+
+
+
+```
+
+
+
+#  define XGBoost
+```{r}
+run_xgb_analysis <- function(train_data, test_data, dataset_name,
+                             nfold = 10, smote_ratio = 0.6,
+                             min_spec = 0.80, min_acc = 0.80, target_sens = 0.90,
+                             th_grid = seq(0.01,0.99,0.01),
+                             top_n_shap = 10){
+  set.seed(111)
+  for (nm in c("DD","gender","Grade")) if (nm %in% names(train_data)){
+    if (nm=="DD"){
+      train_data$DD <- factor(train_data$DD, levels=c("Dyslexia","Normal"))
+      test_data$DD  <- factor(test_data$DD,  levels=c("Dyslexia","Normal"))
+    } else {
+      train_data[[nm]] <- factor(as.character(train_data[[nm]]))
+      test_data[[nm]]  <- factor(as.character(test_data[[nm]]), levels=levels(train_data[[nm]]))
+    }
+  }
+
+  rec_full  <- make_recipe(train_data, smote_ratio = smote_ratio)
+  prep_full <- recipes::prep(rec_full, training=train_data)
+  tr_full   <- recipes::juice(prep_full)
+  te_full   <- recipes::bake(prep_full, new_data=test_data)
+  y_tr <- train_data$DD; y_te <- test_data$DD
+
+  customSummary <- make_ConSens_summary(min_spec, min_acc, th_grid)
+
+  train_with_id <- dplyr::mutate(train_data, .row_id = dplyr::row_number())
+  folds <- rsample::vfold_cv(train_with_id, v = nfold, strata = "DD")
+  oof <- numeric(nrow(train_with_id))
+
+  for (k in seq_along(folds$splits)){
+    dat_tr <- rsample::analysis(folds$splits[[k]])
+    dat_va <- rsample::assessment(folds$splits[[k]])
+    idx_va <- dat_va$.row_id
+
+    for (nm in c("gender","Grade")) if (nm %in% names(dat_tr)){
+      dat_tr[[nm]] <- factor(as.character(dat_tr[[nm]]))
+      dat_va[[nm]] <- factor(as.character(dat_va[[nm]]), levels=levels(dat_tr[[nm]]))
+    }
+
+    rec_k  <- make_recipe(dplyr::select(dat_tr, - .row_id), smote_ratio=smote_ratio)
+    prep_k <- recipes::prep(rec_k, training=dat_tr)
+    tr_k   <- recipes::juice(prep_k)
+    va_k   <- recipes::bake(prep_k, new_data=dplyr::select(dat_va, - .row_id))
+
+    ctrl <- caret::trainControl(method="cv", number=5, classProbs=TRUE, summaryFunction=customSummary)
+    grid <- expand.grid(
+      nrounds            = c(200, 400),
+      max_depth          = c(3, 5, 7),
+      eta                = c(0.05, 0.1, 0.2),
+      gamma              = c(0, 1),
+      colsample_bytree   = c(0.7, 1.0),
+      min_child_weight   = c(1, 5),
+      subsample          = c(0.7, 1.0)
+    )
+    fit <- caret::train(DD ~ ., data=tr_k,
+                        method="xgbTree", trControl=ctrl, tuneGrid=grid,
+                        metric="ConSens", verbosity=0)
+    oof[idx_va] <- as.numeric(predict(fit, va_k, type="prob")[,"Dyslexia"])
+  }
+
+  thr_pick <- pick_threshold_constrained(train_data$DD, oof, th_grid, target_sens, min_spec, min_acc)
+  th_star  <- as.numeric(thr_pick$th)
+  sel_idx  <- which.min(abs(thr_pick$table$threshold - th_star))
+  thresh_selected_row <- thr_pick$table[sel_idx, , drop = FALSE]
+
+
+  ctrl_all <- caret::trainControl(method="cv", number=10, classProbs=TRUE, summaryFunction=customSummary)
+  grid_all <- grid  
+  fit_full <- caret::train(DD ~ ., data=tr_full,
+                           method="xgbTree", trControl=ctrl_all, tuneGrid=grid_all,
+                           metric="ConSens", verbosity=0)
+
+  p_test <- as.numeric(predict(fit_full, te_full, type="prob")[,"Dyslexia"])
+  truth  <- factor(y_te, levels=c("Dyslexia","Normal"))
+  pred   <- factor(ifelse(p_test>=th_star, "Dyslexia","Normal"), levels=c("Dyslexia","Normal"))
+
+  tp <- sum(truth=="Dyslexia" & pred=="Dyslexia"); fp <- sum(truth=="Normal" & pred=="Dyslexia")
+  tn <- sum(truth=="Normal" & pred=="Normal");     fn <- sum(truth=="Dyslexia" & pred=="Normal")
+
+  metrics <- tibble::tibble(
+    Dataset         = dataset_name,
+    Threshold       = round(th_star,2),
+    Threshold_exact = signif(th_star,12),
+    AUC         = as.numeric(yardstick::roc_auc_vec(truth, p_test, event_level="first")),
+    Accuracy    = (tp+tn)/(tp+fp+tn+fn),
+    Sensitivity = ifelse(tp+fn>0, tp/(tp+fn), NA_real_),
+    Specificity = ifelse(tn+fp>0, tn/(tn+fp), NA_real_),
+    Precision   = ifelse(tp+fp>0, tp/(tp+fp), NA_real_),
+    F1          = ifelse((2*tp+fp+fn)>0, 2*tp/(2*tp+fp+fn), NA_real_),
+    F2          = ifelse((5*tp+4*fn+fp)>0, 5*tp/(5*tp+4*fn+fp), NA_real_)
+  )
+  conf_mx <- yardstick::conf_mat(tibble::tibble(truth=truth, pred=pred),
+                                 truth=truth, estimate=pred)
+
+
+  X_for_shap <- tr_full %>% dplyr::select(-DD) %>% as.data.frame()
+  pred_fun_prob <- function(model, newdata){
+    as.numeric(predict(model, newdata=as.data.frame(newdata), type="prob")[,"Dyslexia"])
+  }
+  xgb_shap <- compute_shap(fit_full, X_for_shap, y_tr, pred_fun_prob, nsim=100, top_n=top_n_shap)
+
+  list(
+    metrics=metrics, conf_mat=conf_mx, probs_test=p_test, truth_test=truth,
+    threshold=th_star, thresh_table=thr_pick$table, thresh_best=thr_pick$best_row,
+    thresh_selected_row = thresh_selected_row,
+    threshold_exact=th_star,
+    params=list(min_spec=min_spec, min_acc=min_acc, target_sens=target_sens, th_grid=th_grid),
+    shap_plot=xgb_shap$plot,
+    shap_values_logit=xgb_shap$shap_logit,
+    shap_values_deltap=xgb_shap$shap_deltap,
+    shap_imp_deltap=xgb_shap$imp_deltap,
+    model=fit_full, x_test=te_full %>% dplyr::select(-DD)
+  )
+}
+
+
+```
+
+
+##  define MLP
+```{r}
+run_mlp_analysis <- function(train_data, test_data, dataset_name,
+                             nfold = 10, smote_ratio = 0.6,
+                             min_spec = 0.80,   
+                             min_acc  = 0.80,    
+                             target_sens = 0.90, 
+                             th_grid = seq(0.01, 0.99, by = 0.01),
+                             epochs = 15, batch_size = 32,
+                             units1 = c(64, 128),
+                             units2 = c(32, 64),
+                             l2_reg = c(1e-4, 1e-5),
+                             dropout = c(0.2),
+                             lr = c(1e-3),
+                             top_n_shap = 10) {
+
+  set.seed(111)
+  if (requireNamespace("tensorflow", quietly = TRUE)) {
+    try({ tensorflow::tf$random$set_seed(111) }, silent = TRUE)
+  }
+
+  to_pos_first <- function(x){
+    if (is.factor(x) && levels(x)[1] != "Dyslexia")
+      factor(x, levels = c("Dyslexia","Normal")) else x
+  }
+  train_data$DD <- to_pos_first(train_data$DD)
+  test_data$DD  <- to_pos_first(test_data$DD)
+
+  for (nom in c("gender","Grade")) if (nom %in% names(train_data)) {
+    train_data[[nom]] <- factor(as.character(train_data[[nom]]))
+    test_data[[nom]]  <- factor(as.character(test_data[[nom]]),
+                                levels = levels(train_data[[nom]]))
+  }
+
+  rec_full  <- make_recipe(train_data, smote_ratio = smote_ratio)
+  prep_full <- recipes::prep(rec_full, training = train_data)
+  tr_full   <- recipes::juice(prep_full)                      
+  te_full   <- recipes::bake(prep_full, new_data = test_data) 
+  y_tr      <- train_data$DD
+  y_te      <- test_data$DD
+
+  pick_threshold_constrained <- function(truth, prob,
+                                         ths = th_grid,
+                                         target_sens_val = target_sens,
+                                         min_spec_val    = min_spec,
+                                         min_acc_val     = min_acc) {
+    tab  <- .pr_table(truth, prob, ths)
+    feas <- subset(tab, Specificity >= min_spec_val & Accuracy >= min_acc_val)
+
+    feas_target <- subset(feas, Sensitivity >= target_sens_val)
+    if (nrow(feas_target)) {
+      J <- with(feas_target, Sensitivity + Specificity - 1)
+      best <- feas_target[order(-J, -feas_target$F1), ][1, , drop = FALSE]
+      return(list(th = best$threshold, table = tab, best_row = best, met_all = TRUE))
+    }
+
+    if (nrow(feas)) {
+      J <- with(feas, Sensitivity + Specificity - 1)
+      best <- feas[order(-feas$Sensitivity, -J, -feas$F1), ][1, , drop = FALSE]
+      return(list(th = best$threshold, table = tab, best_row = best, met_all = FALSE))
+    }
+
+    J <- with(tab, Sensitivity + Specificity - 1)
+    best <- tab[order(-J, -tab$F1), ][1, , drop = FALSE]
+    warning(sprintf("Threshold satisfying Sp>=%.2f & Acc>=%.2f not found; returning max J point (Se=%.3f, Sp=%.3f, Acc=%.3f, thr=%.2f).",
+                    min_spec_val, min_acc_val, best$Sensitivity, best$Specificity, best$Accuracy, best$threshold))
+    list(th = best$threshold, table = tab, best_row = best, met_all = FALSE)
+  }
+
+  build_mlp <- function(input_dim, u1, u2, dp, l2v, lr){
+    k <- keras::backend()
+    keras::keras_model_sequential() |>
+      keras::layer_dense(units = u1, activation = "relu",
+                         input_shape = input_dim,
+                         kernel_regularizer = keras::regularizer_l2(l2v)) |>
+      keras::layer_dropout(rate = dp) |>
+      keras::layer_dense(units = u2, activation = "relu",
+                         kernel_regularizer = keras::regularizer_l2(l2v)) |>
+      keras::layer_dropout(rate = dp) |>
+      keras::layer_dense(units = 1, activation = "sigmoid") |>
+      keras::compile(
+        optimizer = keras::optimizer_rmsprop(learning_rate = lr),
+        loss = "binary_crossentropy"
+      )
+  }
+
+  y01 <- function(f) as.numeric(f == "Dyslexia")
+
+  grid <- expand.grid(
+    u1 = units1, u2 = units2,
+    dp = dropout, l2v = l2_reg, lrv = lr,
+    KEEP.OUT.ATTRS = FALSE
+  )
+
+  train_with_id <- dplyr::mutate(train_data, .row_id = dplyr::row_number())
+  folds <- rsample::vfold_cv(train_with_id, v = nfold, strata = "DD")
+  oof_prob <- numeric(nrow(train_with_id))
+  winners  <- list()  
+
+  score_ConSens <- function(truth, prob){
+    tab <- .pr_table(truth, prob, ths = th_grid)
+    ok  <- with(tab, Specificity >= min_spec & Accuracy >= min_acc)
+    if (!any(ok)) return(0)
+    max(tab$Sensitivity[ok], na.rm = TRUE)
+  }
+
+  for (k in seq_along(folds$splits)) {
+    dat_tr <- rsample::analysis(folds$splits[[k]])
+    dat_va <- rsample::assessment(folds$splits[[k]])
+    idx_va <- dat_va$.row_id
+
+    rec_k  <- make_recipe(dplyr::select(dat_tr, - .row_id), smote_ratio = smote_ratio)
+    prep_k <- recipes::prep(rec_k, training = dat_tr)
+    tr_k   <- recipes::juice(prep_k)                                     
+    va_k   <- recipes::bake(prep_k, new_data = dplyr::select(dat_va, - .row_id))
+
+    X_tr <- as.matrix(tr_k |> dplyr::select(-DD))
+    z_tr <- y01(tr_k$DD)
+    X_va <- as.matrix(va_k |> dplyr::select(-DD))
+    z_va <- factor(va_k$DD, levels = c("Dyslexia","Normal"))
+
+    grid_scores <- c()
+    preds_hold  <- list()
+    for (gi in seq_len(nrow(grid))) {
+      g <- grid[gi, ]
+      mdl <- build_mlp(ncol(X_tr), g$u1, g$u2, g$dp, g$l2v, g$lrv)
+      history <- mdl %>% keras::fit(
+        x = X_tr, y = z_tr,
+        epochs = epochs, batch_size = batch_size,
+        validation_split = 0, verbose = 0
+      )
+      p_va <- as.numeric(mdl %>% predict(X_va, verbose = 0))
+      preds_hold[[gi]] <- p_va
+      grid_scores[gi]  <- score_ConSens(z_va, p_va)
+      try({ keras::k_clear_session() }, silent = TRUE)
+    }
+    best_idx <- which.max(grid_scores)
+    oof_prob[idx_va] <- preds_hold[[best_idx]]
+    winners[[k]] <- dplyr::bind_cols(grid[best_idx, ], tibble::tibble(ConSens = max(grid_scores, na.rm = TRUE)))
+  }
+
+  win_tab <- dplyr::bind_rows(winners) |>
+    dplyr::group_by(u1, u2, dp, l2v, lrv) |>
+    dplyr::summarise(n = dplyr::n(), meanConSens = mean(ConSens), .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(n), dplyr::desc(meanConSens))
+  best_cfg <- win_tab[1, ]
+
+  thr_pick <- pick_threshold_constrained(
+    truth = train_data$DD, prob = oof_prob,
+    ths = th_grid, target_sens_val = target_sens,
+    min_spec_val = min_spec, min_acc_val = min_acc
+  )
+  th_star <- as.numeric(thr_pick$th)
+  sel_idx <- which.min(abs(thr_pick$table$threshold - th_star))
+  thresh_selected_row <- thr_pick$table[sel_idx, , drop = FALSE]
+
+  X_tr_full <- as.matrix(tr_full |> dplyr::select(-DD))
+  z_tr_full <- y01(tr_full$DD)
+  X_te      <- as.matrix(te_full |> dplyr::select(-DD))
+  truth_te  <- factor(y_te, levels = c("Dyslexia","Normal"))
+
+  mdl_full <- build_mlp(
+    input_dim = ncol(X_tr_full),
+    u1 = best_cfg$u1, u2 = best_cfg$u2,
+    dp = best_cfg$dp, l2v = best_cfg$l2v, lr = best_cfg$lrv
+  )
+  history <- mdl_full %>% keras::fit(
+    x = X_tr_full, y = z_tr_full,
+    epochs = epochs, batch_size = batch_size,
+    validation_split = 0, verbose = 0
+  )
+  p_test <- as.numeric(mdl_full %>% predict(X_te, verbose = 0))
+  pred_te <- factor(ifelse(p_test >= th_star, "Dyslexia","Normal"),
+                    levels = c("Dyslexia","Normal"))
+
+  tp <- sum(truth_te=="Dyslexia" & pred_te=="Dyslexia")
+  fp <- sum(truth_te=="Normal"   & pred_te=="Dyslexia")
+  tn <- sum(truth_te=="Normal"   & pred_te=="Normal")
+  fn <- sum(truth_te=="Dyslexia" & pred_te=="Normal")
+  Acc <- tibble::tibble(
+    Accuracy    = (tp+tn)/max(1,tp+fp+tn+fn),
+    Sensitivity = ifelse(tp+fn>0, tp/(tp+fn), NA_real_),
+    Specificity = ifelse(tn+fp>0, tn/(tn+fp), NA_real_),
+    Precision   = ifelse(tp+fp>0, tp/(tp+fp), NA_real_),
+    F1          = ifelse((2*tp+fp+fn)>0, 2*tp/(2*tp+fp+fn), NA_real_),
+    F2          = ifelse((5*tp+4*fn+fp)>0, 5*tp/(5*tp+4*fn+fp), NA_real_)
+  )
+  conf_df <- tibble::tibble(truth = truth_te, pred = pred_te)
+  conf_mx <- yardstick::conf_mat(conf_df, truth = truth, estimate = pred)
+
+  metrics <- tibble::tibble(
+    Dataset         = dataset_name,
+    Threshold       = round(th_star, 2),
+    Threshold_exact = signif(th_star, 12),
+    AUC         = as.numeric(yardstick::roc_auc_vec(truth_te, p_test, event_level = "first")),
+    Accuracy    = Acc$Accuracy,
+    Sensitivity = Acc$Sensitivity,
+    Specificity = Acc$Specificity,
+    Precision   = Acc$Precision,
+    F1          = Acc$F1,
+    F2          = Acc$F2
+  )
+
+  pred_fun_mlp <- function(model, newdata){
+    as.numeric(model %>% predict(as.matrix(newdata), verbose = 0))
+  }
+  shap_out <- compute_shap(
+    model         = mdl_full,
+    X_mat         = tr_full |> dplyr::select(-DD) |> as.data.frame(),
+    y_factor      = y_tr,
+    pred_fun_prob = pred_fun_mlp,
+    nsim          = 50,
+    top_n         = top_n_shap
+  )
+
+  best_oof_row <- as.data.frame(thr_pick$best_row)
+  thr_rep      <- as.numeric(best_oof_row$threshold)
+  pred_rep     <- factor(ifelse(p_test >= thr_rep, "Dyslexia","Normal"),
+                         levels = c("Dyslexia","Normal"))
+  tp2 <- sum(truth_te=="Dyslexia" & pred_rep=="Dyslexia")
+  fp2 <- sum(truth_te=="Normal"   & pred_rep=="Dyslexia")
+  tn2 <- sum(truth_te=="Normal"   & pred_rep=="Normal")
+  fn2 <- sum(truth_te=="Dyslexia" & pred_rep=="Normal")
+  rep_metrics_test <- data.frame(
+    Thr_from_OOF = thr_rep,
+    OOF_Sens = best_oof_row$Sensitivity,
+    OOF_Spec = best_oof_row$Specificity,
+    OOF_Acc  = best_oof_row$Accuracy,
+    OOF_F1   = best_oof_row$F1,
+    Test_Sens = ifelse(tp2+fn2>0, tp2/(tp2+fn2), NA_real_),
+    Test_Spec = ifelse(tn2+fp2>0, tn2/(tn2+fp2), NA_real_),
+    Test_Acc  = (tp2+tn2)/max(1, tp2+fp2+tn2+fn2),
+    Test_Prec = ifelse(tp2+fp2>0, tp2/(tp2+fp2), NA_real_),
+    Test_F1   = ifelse((2*tp2+fp2+fn2)>0, 2*tp2/(2*tp2+fp2+fn2), NA_real_)
+  )
+
+  list(
+    metrics      = metrics,
+    conf_mat     = conf_mx,
+    probs_test   = p_test,
+    truth_test   = truth_te,
+    threshold    = th_star,
+    thresh_table = thr_pick$table,
+    thresh_best  = thr_pick$best_row,
+    report_best_row     = best_oof_row,
+    report_test_at_best = rep_metrics_test,
+    threshold_exact     = th_star,
+    thresh_selected_row = thresh_selected_row,
+    params = list(min_spec = min_spec, min_acc = min_acc,
+                  target_sens = target_sens, th_grid = th_grid,
+                  epochs = epochs, batch_size = batch_size,
+                  best_cfg = best_cfg, win_table = win_tab),
+    roc_plot     = {
+      roc_obj <- pROC::roc(response = truth_te, predictor = p_test,
+                           levels = c("Dyslexia","Normal"), direction = ">")
+      pROC::ggroc(roc_obj) +
+        ggplot2::geom_abline(linetype = "dashed", colour = "grey50") +
+        ggplot2::annotate("text", x = 0.7, y = 0.3,
+                          label = paste("AUC =", round(pROC::auc(roc_obj), 3))) +
+        ggplot2::labs(title = paste("ROC Curve - MLP -", dataset_name),
+                      x = "False Positive Rate", y = "True Positive Rate") +
+        ggplot2::theme_bw()
+    },
+    shap_plot    = shap_out$plot,         
+    shap_values  = shap_out$shap_deltap,  
+    shap_imp_df  = shap_out$imp_deltap,    
+    model        = mdl_full,
+    x_test       = te_full |> dplyr::select(-DD)
+  )
+}
+
+```
+
+# define vote
+```{r}
+vote_optimize <- function(i,
+                          step_w = 0.10,
+                          th_grid = seq(0.01, 0.99, 0.01),
+                          min_spec = 0.80, min_acc = 0.80, target_sens = 0.90,
+                          top_n_shap = 10,
+                          verbose = TRUE){
+
+  lr  <- get_result_obj("LR",  i)
+  rf  <- get_result_obj("RF",  i)
+  xgb <- get_result_obj("XGB", i)
+  mlp <- get_result_obj("MLP", i)
+  truth <- lr$truth_test %||% rf$truth_test %||% xgb$truth_test %||% mlp$truth_test
+  if (is.null(truth)) stop(sprintf("Dataset %d: truth_test not found.", i))
+  truth <- factor(truth, levels = c("Dyslexia","Normal"))
+
+  X_ref <- lr$x_test %||% rf$x_test %||% xgb$x_test %||% mlp$x_test
+  X_ref <- as.data.frame(X_ref)
+
+  parts <- list()
+  if (!is.null(lr))  { p <- fetch_probs_safe(lr);  if (!is.null(p)) parts$LR  <- p }
+  if (!is.null(rf))  { p <- fetch_probs_safe(rf);  if (!is.null(p)) parts$RF  <- p }
+  if (!is.null(xgb)) { p <- fetch_probs_safe(xgb); if (!is.null(p)) parts$XGB <- p }
+  if (!is.null(mlp)) { p <- fetch_probs_safe(mlp); if (!is.null(p)) parts$MLP <- p }
+  if (!length(parts)) stop(sprintf("Dataset %d: No available single-model probabilities (probs_test).", i))
+
+
+  L <- min(vapply(parts, length, integer(1)))
+  parts     <- lapply(parts, function(v) v[seq_len(L)])
+  truth_use <- truth[seq_len(L)]
+  X_use     <- X_ref[seq_len(L), , drop = FALSE]
+
+  model_names <- names(parts)
+  M <- length(model_names)
+  
+  W <- .gen_weight_grid(M, step = step_w)
+  if (nrow(W) == 0) stop("Weight grid is empty, please increase step_w or check M.")
+
+  best <- list(score = -Inf, status = NA_character_, w = rep(NA_real_, M),
+               thr = NA_real_, row = NULL, p = NULL)
+
+  if (verbose) cat(sprintf("[Vote-%d] Evaluating %d weight combinations (step=%.2f)...\n", i, nrow(W), step_w))
+
+  for (k in seq_len(nrow(W))) {
+    w <- W[k, ]
+    P <- 0
+    for (j in seq_len(M)) P <- P + as.numeric(parts[[j]]) * w[j]
+
+    pick <- .pick_threshold_constrained_local(truth_use, P, th_grid,
+                                              min_spec, min_acc, target_sens)
+    r <- pick$best_row
+    if (pick$status == "HIT") {
+      J <- with(r, Sensitivity + Specificity - 1)
+      score <- 1000 + r$Sensitivity + 0.01*J + 1e-4*r$F1   
+    } else if (pick$status == "LIMIT") {
+      J <- with(r, Sensitivity + Specificity - 1)
+      score <- 10 + r$Sensitivity + 0.01*J + 1e-4*r$F1
+    } else {
+      J <- with(r, Sensitivity + Specificity - 1)
+      score <- r$Sensitivity + 0.01*J + 1e-4*r$F1
+    }
+
+    if (score > best$score) {
+      best <- list(score = score, status = pick$status, w = w,
+                   thr = as.numeric(pick$th), row = r, p = P)
+      if (verbose && (k %% 50 == 0 || k == nrow(W))) {
+        cat(sprintf(" Evaluated %d/%d; Current best: %s  w=%s  thr=%.2f  Se=%.3f Sp=%.3f Acc=%.3f\n",
+                    k, nrow(W), pick$status,
+                    paste(sprintf("%s=%.2f", model_names, w), collapse=", "),
+                    best$thr, r$Sensitivity, r$Specificity, r$Accuracy))
+      }
+    }
+  }
+
+  p_best <- as.numeric(best$p)
+  pred   <- factor(ifelse(p_best >= best$thr, "Dyslexia","Normal"),
+                   levels = c("Dyslexia","Normal"))
+  cnt    <- .cm_counts(truth_use, pred)
+  cm_mat <- .cm2matrix(cnt)
+  base   <- .metrics_from_counts(cnt)
+  aucv   <- suppressWarnings(yardstick::roc_auc_vec(truth_use, p_best, event_level = "first"))
+
+  metrics <- tibble::tibble(
+    Dataset = i,
+    Status  = best$status,
+    Weights = paste(sprintf("%s=%.2f", model_names, best$w), collapse="; "),
+    Threshold = round(best$thr, 2),
+    AUC = as.numeric(aucv)
+  ) |> dplyr::bind_cols(base)
+
+  roc_plot <- {
+    roc_obj <- pROC::roc(response = truth_use, predictor = p_best,
+                         levels = c("Dyslexia","Normal"), direction = ">")
+    pROC::ggroc(roc_obj) +
+      ggplot2::geom_abline(linetype = "dashed", colour = "grey50") +
+      ggplot2::annotate("text", x = 0.7, y = 0.3,
+                        label = paste("AUC =", round(pROC::auc(roc_obj), 3))) +
+      ggplot2::labs(title = paste("ROC Curve - VOTE -", i),
+                    x = "False Positive Rate", y = "True Positive Rate") +
+      ggplot2::theme_bw()
+  }
+
+  shap_plot <- NULL; shap_imp_df <- NULL; shap_values <- NULL
+  if (top_n_shap > 0) {
+    surro <- build_prob_surrogate(X_use, p_best)  
+    shap_out <- try({
+      compute_shap(
+        model         = NULL,
+        X_mat         = X_use,
+        y_factor      = truth_use,
+        pred_fun_prob = function(m, newdata) surro(as.data.frame(newdata)),
+        nsim          = 50,
+        top_n         = top_n_shap,
+        base_use      = "mean_logit"
+      )
+    }, silent = TRUE)
+
+    if (!inherits(shap_out, "try-error")) {
+      shap_plot   <- shap_out$plot        
+      shap_imp_df <- shap_out$imp_df
+      shap_values <- shap_out$matrix    
+    } else if (verbose) {
+      message(sprintf("[Vote-%d] SHAP skipped：%s", i, as.character(shap_out)))
+    }
+  }
+
+  list(
+    metrics     = metrics,
+    conf_mat    = cm_mat,
+    probs_vote  = p_best,
+    truth_test  = truth_use,
+    threshold   = best$thr,
+    weights     = setNames(as.numeric(best$w), model_names),
+    oof_bestrow = best$row,
+    roc_plot    = roc_plot,
+    shap_plot   = shap_plot,
+    shap_imp_df = shap_imp_df,
+    shap_values = shap_values
+  )
+}
+```
+
+## Run Full-variable Models (Dataset 1)
+
+
+```{r}
+
+# =====================================================================
+# Option A: Train Models from Scratch (Commented out by default)
+# You can uncomment the code below to retrain all models.
+#
+# NOTE ON REPRODUCIBILITY:
+# - LR, RF, and XGBoost results are highly stable with the set seed.
+# - MLP and Vote models involve Keras backend randomness and multi-threading.
+#   Retraining them will result in minor, expected fluctuations in metrics.
+# =====================================================================
+# # 1. Logistic Regression (LR)
+# LR_15sd_results_1 <- run_lr_analysis(
+#   train_data = RD_4ML_1_train,
+#   test_data  = RD_4ML_1_test,
+#   dataset_name = "RD_4ML_1"
+# )
+# 
+# # 2. Random Forest (RF)
+# RF_15sd_results_1 <- run_rf_analysis(
+#   train_data = RD_4ML_1_train,
+#   test_data  = RD_4ML_1_test,
+#   dataset_name = "RD_4ML_1"
+# )
+# 
+# # 3. XGBoost (XGB)
+# XGB_15sd_results_1 <- run_xgb_analysis(
+#   train_data = RD_4ML_1_train,
+#   test_data  = RD_4ML_1_test,
+#   dataset_name = "RD_4ML_1"
+# )
+
+# 4. Multilayer Perceptron (MLP)
+# MLP_15sd_results_1 <- run_mlp_analysis(
+#   train_data = RD_4ML_1_train,
+#   test_data  = RD_4ML_1_test,
+#   dataset_name = "RD_4ML_1"
+# )
+
+# 5. Voting Ensemble (Vote) 
+# res_list_vote <- vote_optimize(
+#   i = 1,
+#   step_w = 0.10,                       
+#   th_grid = seq(0.01, 0.99, 0.01),
+#   min_spec = 0.80, 
+#   min_acc = 0.80, 
+#   target_sens = 0.90,
+#   top_n_shap = 10,
+#   verbose = TRUE
+# )
+# =====================================================================
+# Option B: Load Pre-trained Models (Recommended)
+# - Loading LR, RF, and XGBoost is purely for convenience to save training time.
+# - Loading MLP and Vote is REQUIRED to achieve 100% exact reproduction 
+#   of the paper's figures, metrics, and DeLong/McNemar test p-values.
+# =====================================================================
+LR_15sd_results_1  <- readRDS("LR_results.rds")
+RF_15sd_results_1  <- readRDS("RF_results.rds")
+XGB_15sd_results_1 <- readRDS("XGB_results.rds")
+MLP_15sd_results_1 <- readRDS("MLP_results.rds")
+res_list_vote      <- readRDS("Vote_results.rds")
+
+
+```
+
+# full-model results
+```{r}
+# 1. Extract and summarize metrics for the 5 models
+metrics_list <- list(
+  LR   = LR_15sd_results_1$metrics,
+  RF   = RF_15sd_results_1$metrics,
+  XGB  = XGB_15sd_results_1$metrics,
+  MLP  = MLP_15sd_results_1$metrics,
+  Vote = res_list_vote[[1]]$metrics  
+)
+
+# Merge into a dataframe
+metrics_tbl_1 <- dplyr::bind_rows(metrics_list, .id = "Algorithm") |>
+  dplyr::select(-Threshold_exact, -Status, -Weights)
+
+cat("\n=== Table: Metrics Comparison (Full Variables) ===\n")
+print(metrics_tbl_1)
+
+# 2. Sequentially display detailed results for each model
+results_list_1 <- list(
+  LR   = LR_15sd_results_1,
+  RF   = RF_15sd_results_1,
+  XGB  = XGB_15sd_results_1,
+  MLP  = MLP_15sd_results_1,
+  Vote =  res_list_vote[[1]]
+)
+
+for (model_name in names(results_list_1)) {
+  cat("\n======================================================\n")
+  cat("   Model:", model_name, "(Dataset 1: Full Variables)\n")
+  cat("======================================================\n")
+  
+  res <- results_list_1[[model_name]]
+  
+  # A. Print confusion matrix
+  cat("\n--- Confusion Matrix ---\n")
+  if (!is.null(res$conf_mat)) {
+    cm <- if (inherits(res$conf_mat, "conf_mat")) res$conf_mat$table else res$conf_mat
+    print(cm)
+  } else {
+    cat("No confusion matrix available.\n")
+  }
+  
+  # B. Print specific SHAP values (preview top 10
+  if (!is.null(res$shap_values)) {
+    cat("\n--- Specific SHAP Values (Top Rows) ---\n")
+    print(head(res$shap_values, 10))
+  } else if (!is.null(res$shap_data)) {
+    cat("\n--- Specific SHAP Data (Top Rows) ---\n")
+    print(head(res$shap_data, 10))
+  }
+  
+  # C. Print SHAP
+  if (!is.null(res$shap_plot)) {
+    cat("\n--- SHAP Plot ---\n")
+    print(res$shap_plot)
+  }
+}
+```
+
+
+
+## Run XGBoost Sub-models (Dataset 2 to 7)
+```{r}
+# =====================================================================
+# Option A: Train Sub-models from Scratch (Commented out by default)
+# XGBoost results are stable. You can uncomment the loop below to retrain 
+# the sub-models for Datasets 2 to 7.
+# =====================================================================
+# for (i in 2:7) {
+#   train_name <- paste0("RD_4ML_", i, "_train")
+#   test_name  <- paste0("RD_4ML_", i, "_test")
+#   data_name  <- paste0("RD_4ML_", i)
+#   
+#   result_name <- paste0("XGB_15sd_results_", i)
+#   
+#   assign(result_name, run_xgb_analysis(
+#     train_data   = get(train_name),
+#     test_data    = get(test_name),
+#     dataset_name = data_name
+#   ))
+# }
+
+# =====================================================================
+# Option B: Load Pre-trained XGBoost Sub-models (Recommended)
+# Loaded purely for convenience to bypass the time-consuming grid search, 
+# allowing immediate reproduction of the sub-model ROC curves and comparisons.
+# =====================================================================
+XGB_15sd_results_2 <- readRDS("XGB_results_2.rds")
+XGB_15sd_results_3 <- readRDS("XGB_results_3.rds")
+XGB_15sd_results_4 <- readRDS("XGB_results_4.rds")
+XGB_15sd_results_5 <- readRDS("XGB_results_5.rds")
+XGB_15sd_results_6 <- readRDS("XGB_results_6.rds")
+XGB_15sd_results_7 <- readRDS("XGB_results_7.rds")
+
+```
+
+# XGBoost Sub-models result
+```{r}
+# 1. Extract and summarize metrics for the 6 sub-models
+xgb_sub_metrics <- list()
+
+for (i in 2:7) {
+  res_name <- paste0("XGB_15sd_results_", i)
+  if (exists(res_name)) {
+    res <- get(res_name)
+    # Use Sub-model_i as the list name
+    xgb_sub_metrics[[paste0("Sub_model_", i)]] <- res$metrics
+  }
+}
+
+# Combine into a dataframe
+metrics_tbl_sub <- dplyr::bind_rows(xgb_sub_metrics, .id = "Domain_Submodel")
+cat("\n=== Table: Metrics Comparison (XGBoost Sub-models) ===\n")
+print(metrics_tbl_sub)
+
+
+```
+
+
+
+# comparison of full-model
+```{r}
+
+truth <- XGB_15sd_results_1$truth_test
+
+p_xgb  <- XGB_15sd_results_1$probs_test
+p_vote <- res_list_vote[[1]]$probs_vote
+
+th_xgb  <- XGB_15sd_results_1$threshold
+th_vote <- res_list_vote[[1]]$threshold
+
+pred_xgb  <- factor(ifelse(p_xgb >= th_xgb, "Dyslexia", "Normal"), levels = c("Dyslexia", "Normal"))
+pred_vote <- factor(ifelse(p_vote >= th_vote, "Dyslexia", "Normal"), levels = c("Dyslexia", "Normal"))
+
+
+roc_xgb  <- roc(response = truth, predictor = p_xgb, levels = c("Dyslexia", "Normal"), direction = ">", quiet = TRUE)
+roc_vote <- roc(response = truth, predictor = p_vote, levels = c("Dyslexia", "Normal"), direction = ">", quiet = TRUE)
+delong_res <- roc.test(roc_xgb, roc_vote, method = "delong")
+cat(sprintf("AUC DeLong Test p-value: %.4f\n", delong_res$p.value))
+
+
+acc_table <- table(XGB_Correct = (pred_xgb == truth), VOTE_Correct = (pred_vote == truth))
+mcnemar_acc <- mcnemar.test(acc_table)
+cat(sprintf("Accuracy McNemar Test p-value: %.4f\n", mcnemar_acc$p.value))
+
+
+idx_dd <- (truth == "Dyslexia")
+sen_table <- table(XGB_Pred = pred_xgb[idx_dd], VOTE_Pred = pred_vote[idx_dd])
+mcnemar_sen <- mcnemar.test(sen_table)
+cat(sprintf("Sensitivity McNemar Test p-value: %.4f\n", mcnemar_sen$p.value))
+
+
+idx_td <- (truth == "Normal")
+spe_table <- table(XGB_Pred = pred_xgb[idx_td], VOTE_Pred = pred_vote[idx_td])
+mcnemar_spe <- mcnemar.test(spe_table)
+cat(sprintf("Specificity McNemar Test p-value: %.4f\n", mcnemar_spe$p.value))
+```
+
+# comparison of sub-model
+```{r}
+idx_dd <- (truth == "Dyslexia")
+idx_td <- (truth == "Normal")
+
+xgb_models <- list(
+  Full_Model = XGB_15sd_results_1,
+  Subset_2   = XGB_15sd_results_2,
+  Subset_3   = XGB_15sd_results_3,
+  Subset_4   = XGB_15sd_results_4,
+  Subset_5   = XGB_15sd_results_5,
+  Subset_6   = XGB_15sd_results_6,
+  Subset_7   = XGB_15sd_results_7
+)
+
+p_base    <- xgb_models[[1]]$probs_test
+th_base   <- xgb_models[[1]]$threshold
+pred_base <- factor(ifelse(p_base >= th_base, "Dyslexia", "Normal"), levels = c("Dyslexia", "Normal"))
+roc_base  <- roc(response = truth, predictor = p_base, levels = c("Dyslexia", "Normal"), direction = ">", quiet = TRUE)
+
+comparison_results <- data.frame(
+  Subset_Model = character(),
+  AUC_Base = numeric(),
+  AUC_Sub = numeric(),
+  DeLong_p = numeric(),
+  Acc_Base = numeric(),
+  Acc_Sub = numeric(),
+  Acc_McNemar_p = numeric(),
+  Sen_Base = numeric(),
+  Sen_Sub = numeric(),
+  Sen_McNemar_p = numeric(),
+  Spe_Base = numeric(),
+  Spe_Sub = numeric(),
+  Spe_McNemar_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (i in 2:length(xgb_models)) {
+  m_name <- names(xgb_models)[i]
+  m_obj  <- xgb_models[[i]]
+  
+  p_sub    <- m_obj$probs_test
+  th_sub   <- m_obj$threshold
+  pred_sub <- factor(ifelse(p_sub >= th_sub, "Dyslexia", "Normal"), levels = c("Dyslexia", "Normal"))
+  roc_sub  <- roc(response = truth, predictor = p_sub, levels = c("Dyslexia", "Normal"), direction = ">", quiet = TRUE)
+  
+  delong_test <- roc.test(roc_base, roc_sub, method = "delong")
+  
+  acc_tab <- table(Base_Correct = (pred_base == truth), Sub_Correct = (pred_sub == truth))
+  acc_test <- mcnemar.test(acc_tab)
+  
+  sen_tab <- table(Base_Pred = pred_base[idx_dd], Sub_Pred = pred_sub[idx_dd])
+  sen_test <- mcnemar.test(sen_tab)
+  
+  spe_tab <- table(Base_Pred = pred_base[idx_td], Sub_Pred = pred_sub[idx_td])
+  spe_test <- mcnemar.test(spe_tab)
+  
+  metrics_sub <- m_obj$metrics
+  metrics_base <- xgb_models[[1]]$metrics
+  
+  comparison_results <- rbind(comparison_results, data.frame(
+    Subset_Model  = m_name,
+    AUC_Base      = metrics_base$AUC,
+    AUC_Sub       = metrics_sub$AUC,
+    DeLong_p      = delong_test$p.value,
+    
+    Acc_Base      = metrics_base$Accuracy,
+    Acc_Sub       = metrics_sub$Accuracy,
+    Acc_McNemar_p = acc_test$p.value,
+    
+    Sen_Base      = metrics_base$Sensitivity,
+    Sen_Sub       = metrics_sub$Sensitivity,
+    Sen_McNemar_p = sen_test$p.value,
+    
+    Spe_Base      = metrics_base$Specificity,
+    Spe_Sub       = metrics_sub$Specificity,
+    Spe_McNemar_p = spe_test$p.value
+  ))
+}
+
+print(comparison_results |> mutate(across(where(is.numeric), ~round(.x, 4))))
+
+
+truth <- XGB_15sd_results_2$truth_test
+idx_dd <- (truth == "Dyslexia")
+idx_td <- (truth == "Normal")
+
+sub_models <- list(
+  Subset_2 = XGB_15sd_results_2, 
+  Subset_3 = XGB_15sd_results_3, 
+  Subset_4 = XGB_15sd_results_4, 
+  Subset_5 = XGB_15sd_results_5, 
+  Subset_6 = XGB_15sd_results_6, 
+  Subset_7 = XGB_15sd_results_7 
+)
+
+pairs <- combn(names(sub_models), 2, simplify = FALSE)
+
+res_list <- lapply(pairs, function(p) {
+  m1_name <- p[1]
+  m2_name <- p[2]
+  m1 <- sub_models[[m1_name]]
+  m2 <- sub_models[[m2_name]]
+  
+  p1 <- as.numeric(m1$probs_test)
+  p2 <- as.numeric(m2$probs_test)
+  pred1 <- factor(ifelse(p1 >= m1$threshold, "Dyslexia", "Normal"), levels = c("Dyslexia", "Normal"))
+  pred2 <- factor(ifelse(p2 >= m2$threshold, "Dyslexia", "Normal"), levels = c("Dyslexia", "Normal"))
+  
+  roc1 <- roc(response = truth, predictor = p1, levels = c("Dyslexia", "Normal"), direction = ">", quiet = TRUE)
+  roc2 <- roc(response = truth, predictor = p2, levels = c("Dyslexia", "Normal"), direction = ">", quiet = TRUE)
+  delong_p <- roc.test(roc1, roc2, method = "delong")$p.value
+  
+  tab_acc <- table(pred1 == truth, pred2 == truth)
+  acc_p <- tryCatch(mcnemar.test(tab_acc)$p.value, error = function(e) NA)
+  
+  tab_sen <- table(pred1[idx_dd], pred2[idx_dd])
+  sen_p <- tryCatch(mcnemar.test(tab_sen)$p.value, error = function(e) NA)
+  
+  tab_spe <- table(pred1[idx_td], pred2[idx_td])
+  spe_p <- tryCatch(mcnemar.test(tab_spe)$p.value, error = function(e) NA)
+  
+  data.frame(
+    Model_A = m1_name,
+    Model_B = m2_name,
+    AUC_p = delong_p,
+    Acc_p = acc_p,
+    Sen_p = sen_p,
+    Spe_p = spe_p
+  )
+})
+
+res_df <- bind_rows(res_list)
+
+res_df <- res_df %>%
+  mutate(
+    AUC_p_adj = p.adjust(AUC_p, method = "holm"),
+    Acc_p_adj = p.adjust(Acc_p, method = "holm"),
+    Sen_p_adj = p.adjust(Sen_p, method = "holm"),
+    Spe_p_adj = p.adjust(Spe_p, method = "holm")
+  ) %>%
+  select(Model_A, Model_B, 
+         AUC_p, AUC_p_adj, 
+         Sen_p, Sen_p_adj, 
+         Spe_p, Spe_p_adj,
+         Acc_p, Acc_p_adj)
+
+print(res_df %>% mutate(across(where(is.numeric), ~round(.x, 4))))
+```
+
+
+
+# shap picture
+```{r}
+
+# =====================================================================
+draw_shap_single <- function(model_obj, title_text) {
+  if (is.null(model_obj) || is.null(model_obj$shap_plot)) return(NULL)
+  
+  plot_data <- model_obj$shap_plot$data %>% filter(!is.na(MeanAbsDeltaP))
+  
+  p <- ggplot(plot_data, aes(x = reorder(Feature, MeanAbsDeltaP), y = MeanAbsDeltaP)) +
+    geom_col(width = 0.7, fill = "gray") +  
+    geom_text(aes(label = sprintf("%.3f", MeanAbsDeltaP)), 
+              hjust = -0.15, size = 3.5, color = "black") +
+    coord_flip() +
+    labs(title = title_text, x = "Feature", y = "Mean |Δp|") + 
+    theme_minimal() +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.15))) +
+    theme(
+      plot.title = element_text(hjust = 0.5), 
+      axis.text.y = element_text(size = 11, face = "bold", color = "black"),
+      axis.text.x = element_text(size = 10, color = "black")
+    )
+  
+  return(p)
+}
+
+# 1. LR
+p_lr <- draw_shap_single(LR_15sd_results_1, "Top 10 SHAP (mean |Δp|) - LR")
+if (!is.null(p_lr)) print(p_lr)
+
+# 2. RF
+p_rf <- draw_shap_single(RF_15sd_results_1, "Top 10 SHAP (mean |Δp|) - RF")
+if (!is.null(p_rf)) print(p_rf)
+
+# 3. XGBoost
+p_xgb <- draw_shap_single(XGB_15sd_results_1, "Top 10 SHAP (mean |Δp|) - XGBoost")
+if (!is.null(p_xgb)) print(p_xgb)
+
+# 4. MLP
+p_mlp <- draw_shap_single(MLP_15sd_results_1, "Top 10 SHAP (mean |Δp|) - MLP")
+if (!is.null(p_mlp)) print(p_mlp)
+
+# 5. Vote 
+p_vote <- draw_shap_single(res_list_vote[[1]], "Top 10 SHAP (mean |Δp|) - Vote")
+if (!is.null(p_vote)) print(p_vote)
+```
+
+
+
+# ROC
+```{r}
+get_roc_data <- function(model_obj, model_name) {
+  
+  truth <- model_obj$truth_test
+  
+  if (!is.null(model_obj$probs_test)) {
+    prob <- model_obj$probs_test
+  } else if (!is.null(model_obj$probs_vote)) {
+    prob <- model_obj$probs_vote
+  } else {
+    stop(sprintf("Error: No probability data found in model [%s]!", model_name))
+  }
+  
+  if(is.data.frame(truth)) truth <- truth[[1]]
+  if(is.list(truth)) truth <- unlist(truth)
+  
+  if(is.data.frame(prob)) prob <- prob[[ncol(prob)]]
+  if(is.list(prob)) prob <- unlist(prob)
+  
+  prob <- as.numeric(prob)
+  
+  my_roc <- roc(response = truth, predictor = prob, quiet = TRUE)
+  auc_val <- as.numeric(auc(my_roc))
+  
+  data.frame(
+    FPR = 1 - my_roc$specificities,
+    TPR = my_roc$sensitivities,
+    Model = sprintf("%s (AUC = %.3f)", model_name, auc_val)
+  )
+}
+
+my_colors <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#A65628", "#F781BF")
+
+
+roc_df_1 <- bind_rows(
+  get_roc_data(LR_15sd_results_1,  "LR"),
+  get_roc_data(RF_15sd_results_1,  "RF"),
+  get_roc_data(XGB_15sd_results_1, "XG-Boost"),
+  get_roc_data(MLP_15sd_results_1, "MLP"),
+  get_roc_data(res_list_vote[[1]], "Vote Ensemble") 
+) %>%
+  mutate(Model = factor(Model, levels = unique(Model)))
+
+p_roc_1 <- ggplot(roc_df_1, aes(x = FPR, y = TPR, color = Model)) +
+  geom_path(linewidth = 1.2) + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50", linewidth = 0.8) + 
+  scale_color_manual(values = my_colors[1:5]) + 
+  labs(title = "ROC Curves", x = "False Positive Rate (1 - Specificity)", y = "True Positive Rate (Sensitivity)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title = element_text(face = "plain", size = 12),
+    axis.text = element_text(size = 11, color = "black"),
+    legend.position = c(0.75, 0.25), 
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10)
+  )
+print(p_roc_1)
+
+
+roc_df_2 <- bind_rows(
+  get_roc_data(XGB_15sd_results_2, "Whole-Character Phonology"),
+  get_roc_data(XGB_15sd_results_3, "Whole-Character Orthography"),
+  get_roc_data(XGB_15sd_results_4, "Whole-Character Semantics"),
+  get_roc_data(XGB_15sd_results_5, "Sub-lexical Phonology"),
+  get_roc_data(XGB_15sd_results_6, "Sub-lexical Orthography"),
+  get_roc_data(XGB_15sd_results_7, "Sub-lexical Semantics")
+) %>%
+  mutate(Model = factor(Model, levels = unique(Model)))
+
+p_roc_2 <- ggplot(roc_df_2, aes(x = FPR, y = TPR, color = Model)) +
+  geom_path(linewidth = 1.2) + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50", linewidth = 0.8) + 
+  scale_color_manual(values = my_colors[1:6]) + 
+  labs(title = "ROC Curves", x = "False Positive Rate (1 - Specificity)", y = "True Positive Rate (Sensitivity)") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title = element_text(face = "plain", size = 12),
+    axis.text = element_text(size = 11, color = "black"),
+    legend.position = c(0.75, 0.25), 
+    legend.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10)
+  )
+
+print(p_roc_2)
+```
+
+
